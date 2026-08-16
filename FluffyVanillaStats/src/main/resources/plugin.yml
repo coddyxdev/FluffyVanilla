@@ -1,0 +1,25 @@
+name: FluffyVanillaStats
+version: '${project.version}'
+main: com.fluffyvanilla.stats.FluffyVanillaStats
+api-version: '1.20'
+description: HTTP API for Fluffy Vanilla Discord bot stats
+authors: [FluFFyAdmin]
+
+commands:
+  fluffystats:
+    description: Show live server stats in chat
+    usage: /fluffystats
+    permission: fluffystats.use
+    permission-message: No permission.
+  fluffyreload:
+    description: Reload FluffyVanillaStats config
+    usage: /fluffyreload
+    permission: fluffystats.admin
+
+permissions:
+  fluffystats.use:
+    description: View stats in chat
+    default: op
+  fluffystats.admin:
+    description: Admin commands
+    default: op

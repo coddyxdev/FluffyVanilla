@@ -1,0 +1,5 @@
+@echo off
+title Fluffy Vanilla Bot
+echo Запуск бота...
+python main.py
+pause

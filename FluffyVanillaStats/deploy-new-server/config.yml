@@ -1,0 +1,12 @@
+# FluffyVanillaStats configuration
+# ------------------------------------
+# port: HTTP port the plugin listens on
+# api-key: Leave empty "" to disable authentication.
+#          Set a random string and configure it in the Discord bot (/setup stats server)
+# builds-world: Name of your build world (shown as "TPS построек")
+# farms-world:  Name of your farm world  (shown as "TPS ферм")
+
+port: 31549
+api-key: "8686c07936497b4447149f9c2a78888501eb859dc839b3cbd302f92f2c10f6f4"
+builds-world: "world"
+farms-world: "world"

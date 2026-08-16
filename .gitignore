@@ -1,0 +1,30 @@
+# Секреты — НИКОГДА не коммитить
+.env
+.token
+*.key
+
+# База данных и бэкапы
+fluffy.db
+fluffy.db-shm
+fluffy.db-wal
+data/*.sqlite*
+backups/
+
+# Логи
+*.log
+*.log.*
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Node
+node_modules/
+
+# Maven build output
+FluffyVanillaStats/target/
+
+# Freebuff client state
+.freebuff/

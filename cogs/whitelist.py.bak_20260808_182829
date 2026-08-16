@@ -1,0 +1,938 @@
+"""
+cogs/whitelist.py — Система белого списка Fluffy Vanilla.
+
+Как это работает:
+1. Админ отправляет кнопку «Подать заявку» в канал: /whitelist panel
+2. Игрок жмёт кнопку → открывается анкета (модальное окно)
+3. После отправки создаётся скрытый канал-заявка для админов (игрок его не видит)
+4. Админ жмёт «Одобрить» или «Отклонить» (с указанием причины)
+5. Игроку приходит решение в личные сообщения, ник добавляется в вайтлист MC
+"""
+import discord
+from discord import app_commands
+from discord.ext import commands, tasks
+from datetime import datetime, timezone, timedelta
+import logging
+import re
+import asyncio
+
+from utils.audit import record_audit
+from utils.emojis import MEMBER, VERIFIED, BAWWW, FLOWER, ADMIN_PINK, ARROW_PINK
+from utils.embeds import (
+    ok, err, warn, info, wl_app_embed, wl_info_embed,
+    PINK, PINK_SOFT, SUCCESS, ERROR, CLOSED,
+)
+
+logger = logging.getLogger('FluFFy.Whitelist')
+
+DENY_COOLDOWN_HOURS = 24     # сколько ждать после отказа перед новой заявкой
+NEW_ACCOUNT_DAYS = 7         # аккаунт моложе N дней помечается как подозрительный
+MAX_QUEUE_ATTEMPTS = 288     # 288 попыток × 5 мин = сутки ретраев
+NICK_RE = re.compile(r'^[A-Za-z0-9_]{3,16}$')
+
+
+# ═══════════════════════════ УТИЛИТЫ ════════════════════════════════════════
+
+def _row(row, key, default=None):
+    try:
+        value = row[key]
+        return default if value is None else value
+    except Exception:
+        return default
+
+
+def _is_staff(member: discord.Member) -> bool:
+    p = member.guild_permissions
+    return p.manage_guild or p.administrator
+
+
+async def _settings(bot, guild_id: int):
+    s = await bot.db.get_guild(guild_id)
+    if not s:
+        await bot.db.ensure_guild(guild_id)
+        s = await bot.db.get_guild(guild_id)
+    return s
+
+
+async def _fetchone(bot, sql: str, params=()):
+    cur = await bot.db.db.execute(sql, params)
+    row = await cur.fetchone()
+    await cur.close()
+    return row
+
+
+async def _fetchall(bot, sql: str, params=()):
+    cur = await bot.db.db.execute(sql, params)
+    rows = await cur.fetchall()
+    await cur.close()
+    return rows
+
+
+async def _exec(bot, sql: str, params=()):
+    cur = await bot.db.db.execute(sql, params)
+    await bot.db.db.commit()
+    last_id = cur.lastrowid
+    await cur.close()
+    return last_id
+
+
+async def _mojang_lookup(nick: str):
+    """Проверяет ник через Mojang API. Возвращает (текст статуса, ссылка на скин)."""
+    import aiohttp
+    skin = 'https://mc-heads.net/body/' + nick
+    url = 'https://api.mojang.com/users/profiles/minecraft/' + nick
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=5) as resp:
+                if resp.status == 200:
+                    return '✅ лицензия найдена', skin
+                if resp.status in (204, 404):
+                    return '⚠️ не найден в Mojang (пиратка?)', skin
+                return f'❔ Mojang ответил {resp.status}', skin
+    except Exception:
+        return '❔ проверка недоступна', skin
+
+
+async def _mc_whitelist_add(settings, nick: str):
+    """Добавляет ник в вайтлист Minecraft через HTTP-плагин. Возвращает (ok, заметка)."""
+    mc_host = _row(settings, 'mc_host')
+    mc_port = _row(settings, 'mc_port')
+    mc_key = _row(settings, 'mc_api_key')
+
+    if not (mc_host and mc_port and mc_key and nick):
+        return False, ''
+
+    import aiohttp
+    url = 'http://' + str(mc_host) + ':' + str(mc_port) + '/execute'
+    headers = {'X-API-Key': mc_key, 'Content-Type': 'application/json'}
+    data = f'whitelist add {nick}'
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, headers=headers, data=data, timeout=5.0) as resp:
+                text = await resp.text()
+        logger.info(f'HTTP Command: whitelist add {nick} -> {text}')
+        return True, '\n✅ Ты уже добавлен в вайтлист игрового сервера!'
+    except Exception as e:
+        logger.error(f'Failed to reach MC HTTP API: {e}')
+        return False, ('\n⏳ Сервер сейчас недоступен — бот добавит твой ник автоматически, '
+                       'как только связь восстановится.')
+
+
+async def _mc_whitelist_remove(settings, nick: str):
+    """Удаляет ник из whitelist Minecraft через HTTP-мост."""
+    mc_host = _row(settings, 'mc_host')
+    mc_port = _row(settings, 'mc_port')
+    mc_key = _row(settings, 'mc_api_key')
+
+    if not (mc_host and mc_port and mc_key and nick):
+        return False, 'Не найден Minecraft-ник или настройки API.'
+
+    import aiohttp
+    url = 'http://' + str(mc_host) + ':' + str(mc_port) + '/execute'
+    headers = {'X-API-Key': mc_key, 'Content-Type': 'text/plain'}
+    data = f'whitelist remove {nick}'
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, headers=headers, data=data, timeout=5.0) as resp:
+                body = await resp.text()
+                if not 200 <= resp.status < 300:
+                    logger.error(f'HTTP Command failed: whitelist remove {nick} -> {resp.status} {body}')
+                    return False, f'Minecraft API вернул HTTP {resp.status}.'
+        logger.info(f'HTTP Command: whitelist remove {nick} -> {body}')
+        return True, ''
+    except Exception as e:
+        logger.error(f'Failed to remove {nick} from MC whitelist: {e}')
+        return False, 'Minecraft-сервер или API сейчас недоступен.'
+
+
+async def _dm(user: discord.abc.User, embed: discord.Embed) -> bool:
+    try:
+        await user.send(embed=embed)
+        return True
+    except Exception:
+        return False
+
+
+# ═══════════════════════════ ПАНЕЛЬ ═════════════════════════════════════════
+
+def panel_embed() -> discord.Embed:
+    e = discord.Embed(
+        title='📝 Белый список Fluffy Vanilla',
+        description=(
+            f'{FLOWER} **Fluffy Vanilla** — уютный ванильный сервер для тёплого сообщества 🌿\n\n'
+            f'{ARROW_PINK} Чтобы получить доступ к серверу, оставь заявку — это займёт меньше минуты:\n\n'
+            'Отвечай честно и по делу — так заявку одобрят быстрее 💕'
+        ),
+        color=PINK,
+    )
+    e.set_footer(text='Fluffy Vanilla • Нажми кнопку, чтобы подать заявку')
+    return e
+
+
+class WhitelistPanelView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label='Подать заявку', emoji=MEMBER,
+        style=discord.ButtonStyle.success, custom_id='wl_panel:apply',
+    )
+    async def apply(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await _start_application(interaction)
+
+
+async def _start_application(interaction: discord.Interaction):
+    bot = interaction.client
+    guild_id = interaction.guild_id
+    user = interaction.user
+
+    # 1. Уже одобрен?
+    row = await _fetchone(
+        bot,
+        "SELECT status FROM whitelist_apps WHERE guild_id = ? AND user_id = ? "
+        "AND status IN ('approved', 'completed') LIMIT 1",
+        (guild_id, user.id),
+    )
+    if row:
+        await interaction.response.send_message(
+            embed=info('Ты уже в белом списке 💚 Если возникли проблемы со входом — создай тикет.'),
+            ephemeral=True,
+        )
+        return
+
+    # 2. Уже есть заявка на рассмотрении?
+    row = await _fetchone(
+        bot,
+        "SELECT id FROM whitelist_apps WHERE guild_id = ? AND user_id = ? AND status = 'pending' LIMIT 1",
+        (guild_id, user.id),
+    )
+    if row:
+        await interaction.response.send_message(
+            embed=info('Твоя заявка уже на рассмотрении. Ответ придёт в личные сообщения ⏳'),
+            ephemeral=True,
+        )
+        return
+
+    # 3. Кулдаун после отказа
+    row = await _fetchone(
+        bot,
+        "SELECT reviewed_at FROM whitelist_apps WHERE guild_id = ? AND user_id = ? "
+        "AND status = 'denied' ORDER BY id DESC LIMIT 1",
+        (guild_id, user.id),
+    )
+    if row and _row(row, 'reviewed_at'):
+        try:
+            reviewed = datetime.fromisoformat(str(_row(row, 'reviewed_at')).replace('Z', ''))
+            if reviewed.tzinfo is None:
+                reviewed = reviewed.replace(tzinfo=timezone.utc)
+            unlock = reviewed + timedelta(hours=DENY_COOLDOWN_HOURS)
+            if datetime.now(timezone.utc) < unlock:
+                await interaction.response.send_message(
+                    embed=warn(
+                        f'Твою прошлую заявку отклонили. Подать новую можно '
+                        f'<t:{int(unlock.timestamp())}:R> (<t:{int(unlock.timestamp())}:f>).'
+                    ),
+                    ephemeral=True,
+                )
+                return
+        except Exception:
+            pass
+
+    await interaction.response.send_modal(ApplicationModal())
+
+
+# ═══════════════════════════ АНКЕТА ═════════════════════════════════════════
+
+class ApplicationModal(discord.ui.Modal, title='Заявка в белый список'):
+    nick = discord.ui.TextInput(
+        label='Ник в Minecraft', placeholder='Например: Amioka',
+        min_length=3, max_length=16, required=True,
+    )
+    age = discord.ui.TextInput(
+        label='Сколько тебе лет?', placeholder='Например: 17',
+        min_length=1, max_length=3, required=True,
+    )
+    reason = discord.ui.TextInput(
+        label='Почему хочешь к нам?', style=discord.TextStyle.paragraph,
+        min_length=20, max_length=600, required=True,
+    )
+    about = discord.ui.TextInput(
+        label='Расскажи немного о себе', style=discord.TextStyle.paragraph,
+        min_length=10, max_length=600, required=True,
+    )
+    invited_by = discord.ui.TextInput(
+        label='Кто пригласил? (необязательно)', required=False, max_length=100,
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        nick = str(self.nick).strip()
+        age_raw = str(self.age).strip()
+
+        if not NICK_RE.match(nick):
+            await interaction.response.send_message(
+                embed=err('Ник может содержать только латинские буквы, цифры и `_`, длина 3–16 символов.'),
+                ephemeral=True,
+            )
+            return
+        if not age_raw.isdigit() or not (5 <= int(age_raw) <= 99):
+            await interaction.response.send_message(
+                embed=err('Возраст нужно указать числом (например `17`).'), ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        await _create_application(
+            interaction,
+            nick=nick,
+            age=age_raw,
+            reason=str(self.reason).strip(),
+            about=str(self.about).strip(),
+            invited_by=(str(self.invited_by).strip() or 'никто'),
+        )
+
+
+async def _create_application(interaction, nick, age, reason, about, invited_by):
+    bot = interaction.client
+    guild = interaction.guild
+    user = interaction.user
+    s = await _settings(bot, guild.id)
+
+    # Ник уже занят другой заявкой?
+    busy = await _fetchone(
+        bot,
+        "SELECT user_id FROM whitelist_apps WHERE guild_id = ? AND LOWER(minecraft_nick) = LOWER(?) "
+        "AND status IN ('pending', 'approved', 'completed') LIMIT 1",
+        (guild.id, nick),
+    )
+    if busy and int(_row(busy, 'user_id', 0)) != user.id:
+        await interaction.followup.send(
+            embed=err(f'Ник `{nick}` уже используется другим участником. Укажи свой настоящий ник.'),
+            ephemeral=True,
+        )
+        return
+
+    category = None
+    cat_id = _row(s, 'wl_category_id') or _row(s, 'tech_ticket_category_id')
+    if cat_id:
+        category = guild.get_channel(int(cat_id))
+
+    # Права: заявку видят только админы и бот, сам игрок — НЕТ
+    overwrites = {
+        guild.default_role: discord.PermissionOverwrite(view_channel=False),
+        user: discord.PermissionOverwrite(view_channel=False),
+        guild.me: discord.PermissionOverwrite(
+            view_channel=True, send_messages=True, manage_channels=True, embed_links=True
+        ),
+    }
+    for role in guild.roles:
+        if role.permissions.manage_guild or role.permissions.administrator:
+            overwrites[role] = discord.PermissionOverwrite(
+                view_channel=True, send_messages=True, read_message_history=True
+            )
+
+    safe_name = re.sub(r'[^a-z0-9_-]', '', user.name.lower())[:16] or str(user.id)[:16]
+    try:
+        channel = await guild.create_text_channel(
+            name=f'wl-app-{safe_name}',
+            category=category,
+            overwrites=overwrites,
+            topic=f'Заявка в белый список • {user} • ник: {nick}',
+            reason=f'Whitelist application from {user}',
+        )
+    except discord.Forbidden:
+        await interaction.followup.send(
+            embed=err('Боту не хватает прав «Управлять каналами», чтобы создать заявку. Сообщи администрации.'),
+            ephemeral=True,
+        )
+        return
+    except Exception as e:
+        logger.error(f'Cannot create application channel: {e}')
+        await interaction.followup.send(
+            embed=err('Не удалось создать заявку. Попробуй позже или создай тикет.'), ephemeral=True,
+        )
+        return
+
+    app_id = await _exec(
+        bot,
+        "INSERT INTO whitelist_apps "
+        "(guild_id, user_id, ticket_channel_id, minecraft_nick, join_reason, about_me, age, "
+        " invited_by, status, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)",
+        (guild.id, user.id, channel.id, nick, reason, about, age, invited_by,
+         datetime.now(timezone.utc).isoformat()),
+    )
+
+    mojang_status, skin_url = await _mojang_lookup(nick)
+
+    created = user.created_at
+    account_days = (datetime.now(timezone.utc) - created).days
+    account_info = f'<t:{int(created.timestamp())}:R>'
+    if account_days < NEW_ACCOUNT_DAYS:
+        account_info += f'\n⚠️ аккаунт младше {NEW_ACCOUNT_DAYS} дней'
+
+    embed = wl_app_embed(
+        user, nick, reason, about, age, invited_by,
+        mojang_status=mojang_status, account_info=account_info, skin_url=skin_url,
+    )
+    embed.set_footer(text=f'Fluffy Vanilla • Заявка #{app_id}')
+
+    msg = await channel.send(embed=embed, view=WhitelistReviewView())
+    try:
+        await msg.pin()
+    except Exception:
+        pass
+
+    notify_id = _row(s, 'wl_notify_channel_id')
+    if notify_id:
+        notify = guild.get_channel(int(notify_id))
+        if notify:
+            try:
+                await notify.send(
+                    embed=info(
+                        f'Новая заявка в белый список от {user.mention} (ник `{nick}`)\n'
+                        f'Канал заявки: {channel.mention}',
+                        title='📝 Новая заявка',
+                    )
+                )
+            except Exception:
+                pass
+
+    await interaction.followup.send(
+        embed=ok(
+            'Заявка отправлена! ✨\n\n'
+            'Она **на рассмотрении** у администрации. Решение придёт тебе в личные сообщения — '
+            'убедись, что ЛС от участников сервера у тебя открыты.',
+            title='Заявка принята',
+        ),
+        ephemeral=True,
+    )
+    logger.info(f'WL application #{app_id} submitted by {user} (nick: {nick})')
+
+
+# ═══════════════════════ РАССМОТРЕНИЕ ЗАЯВКИ ════════════════════════════════
+
+class WhitelistReviewView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label='Одобрить', emoji=VERIFIED,
+                       style=discord.ButtonStyle.success, custom_id='wl_review:approve')
+    async def approve(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await _handle_review(interaction, True)
+
+    @discord.ui.button(label='Отклонить', emoji=BAWWW,
+                       style=discord.ButtonStyle.danger, custom_id='wl_review:deny')
+    async def deny(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await _handle_review(interaction, False)
+
+
+async def _get_app_by_channel(bot, channel_id: int):
+    return await _fetchone(
+        bot, 'SELECT * FROM whitelist_apps WHERE ticket_channel_id = ? ORDER BY id DESC LIMIT 1',
+        (channel_id,),
+    )
+
+
+async def _handle_review(interaction: discord.Interaction, approved: bool):
+    bot = interaction.client
+
+    if not _is_staff(interaction.user):
+        await interaction.response.send_message(
+            embed=err('Заявки рассматривает только администрация.'), ephemeral=True,
+        )
+        return
+
+    app = await _get_app_by_channel(bot, interaction.channel_id)
+    if not app:
+        await interaction.response.send_message(
+            embed=err('Заявка не найдена в базе данных.'), ephemeral=True,
+        )
+        return
+
+    if _row(app, 'status') != 'pending':
+        await interaction.response.send_message(
+            embed=info(f'Эта заявка уже обработана (статус: `{_row(app, "status")}`).'), ephemeral=True,
+        )
+        return
+
+
+    if approved:
+        await interaction.response.defer()
+        await _finish_approve(interaction, app, interaction.user)
+    else:
+        await interaction.response.send_modal(DenyReasonModal(app))
+
+
+class DenyReasonModal(discord.ui.Modal, title='Причина отказа'):
+    reason = discord.ui.TextInput(
+        label='Почему заявка отклонена?',
+        placeholder='Игрок увидит этот текст в личных сообщениях',
+        style=discord.TextStyle.paragraph,
+        min_length=3, max_length=600, required=True,
+    )
+
+    def __init__(self, app):
+        super().__init__()
+        self.app = app
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer()
+        await _finish_deny(interaction, self.app, interaction.user, str(self.reason).strip())
+
+
+async def _archive(bot, guild, app, decision_text: str, color: int, reviewer):
+    """Сохраняет анкету и решение в канал-архив, чтобы ничего не терялось."""
+    s = await _settings(bot, guild.id)
+    log_id = _row(s, 'wl_logs_channel_id') or _row(s, 'wl_notify_channel_id')
+    if not log_id:
+        return
+    channel = guild.get_channel(int(log_id))
+    if not channel:
+        return
+
+    user_id = int(_row(app, 'user_id', 0))
+    e = discord.Embed(
+        title=f'Заявка #{_row(app, "id")} — {decision_text}',
+        color=color,
+        timestamp=datetime.now(timezone.utc),
+    )
+    e.add_field(name='Игрок', value=f'<@{user_id}> (`{user_id}`)', inline=True)
+    e.add_field(name='Ник', value=str(_row(app, 'minecraft_nick', '—')), inline=True)
+    e.add_field(name='Возраст', value=str(_row(app, 'age', '—')), inline=True)
+    e.add_field(name='Почему хочет к нам', value=str(_row(app, 'join_reason', '—'))[:1024], inline=False)
+    e.add_field(name='О себе', value=str(_row(app, 'about_me', '—'))[:1024], inline=False)
+    e.add_field(name='Пригласил(а)', value=str(_row(app, 'invited_by', '—')), inline=True)
+    e.add_field(name='Решение принял', value=reviewer.mention, inline=True)
+    e.set_footer(text='Fluffy Vanilla • архив заявок')
+    try:
+        await channel.send(embed=e)
+    except Exception:
+        pass
+
+
+async def _close_channel(interaction, delay: int = 5):
+    try:
+        await asyncio.sleep(delay)
+        await interaction.channel.delete(reason='Whitelist application processed')
+    except Exception:
+        pass
+
+
+async def _finish_approve(interaction, app, reviewer):
+    bot = interaction.client
+    guild = interaction.guild
+    s = await _settings(bot, guild.id)
+    user_id = int(_row(app, 'user_id', 0))
+    nick = str(_row(app, 'minecraft_nick', ''))
+
+    member = guild.get_member(user_id)
+    role_note = ''
+    role_id = _row(s, 'wl_role_id')
+    if member and role_id:
+        role = guild.get_role(int(role_id))
+        if role:
+            try:
+                await member.add_roles(role, reason=f'Whitelist approved by {reviewer}')
+            except discord.Forbidden:
+                role_note = '\n⚠️ Боту не хватает прав, чтобы выдать роль белого списка.'
+            except Exception as e:
+                role_note = f'\n⚠️ Не удалось выдать роль: `{e}`'
+
+    mc_ok, mc_note = await _mc_whitelist_add(s, nick)
+    if not mc_ok and _row(s, 'mc_host') and _row(s, 'mc_api_key'):
+        await _exec(
+            bot,
+            'INSERT INTO wl_mc_queue (guild_id, user_id, nick, attempts, created_at) VALUES (?, ?, ?, 0, ?)',
+            (guild.id, user_id, nick, datetime.now(timezone.utc).isoformat()),
+        )
+
+    await _exec(
+        bot,
+        "UPDATE whitelist_apps SET status = 'completed', reviewed_by = ?, reviewed_at = ? WHERE id = ?",
+        (reviewer.id, datetime.now(timezone.utc).isoformat(), _row(app, 'id')),
+    )
+
+    dm_sent = False
+    if member:
+        dm_sent = await _dm(member, discord.Embed(
+            title='✅ Заявка одобрена!',
+            description=(
+                f'{VERIFIED} Привет, {member.mention}! Твоя заявка на **Fluffy Vanilla** одобрена 💚\n\n'
+                f'**Твой ник:** `{nick}`\n'
+                'Заходи на сервер и располагайся. Если что-то не работает — создай тикет.'
+                + mc_note
+            ),
+            color=SUCCESS,
+        ))
+
+    await _archive(bot, guild, app, 'ОДОБРЕНА', SUCCESS, reviewer)
+
+    warn_dm = '' if dm_sent else '\n⚠️ Не удалось отправить игроку ЛС (закрыты личные сообщения).'
+    await interaction.followup.send(
+        embed=ok(
+            f'Заявка одобрена. Игрок <@{user_id}> (`{nick}`) добавлен в белый список.'
+            f'{role_note}{warn_dm}\n\nКанал будет удалён через 5 секунд.'
+        )
+    )
+    await record_audit(bot, guild.id, 'whitelist.approved', actor_id=reviewer.id, target_id=user_id, metadata={'app_id': _row(app, 'id'), 'nick': nick})
+    logger.info(f'WL app #{_row(app, "id")} approved for {user_id} by {reviewer}')
+    asyncio.create_task(_close_channel(interaction))
+
+
+async def _finish_deny(interaction, app, reviewer, reason: str):
+    bot = interaction.client
+    guild = interaction.guild
+    user_id = int(_row(app, 'user_id', 0))
+    member = guild.get_member(user_id)
+
+    await _exec(
+        bot,
+        "UPDATE whitelist_apps SET status = 'denied', reviewed_by = ?, reviewed_at = ? WHERE id = ?",
+        (reviewer.id, datetime.now(timezone.utc).isoformat(), _row(app, 'id')),
+    )
+
+    dm_sent = False
+    if member:
+        dm_sent = await _dm(member, discord.Embed(
+            title='❌ Заявка отклонена',
+            description=(
+                f'К сожалению, твоя заявка на **Fluffy Vanilla** отклонена.\n\n'
+                f'**Причина:**\n>>> {reason}\n\n'
+                f'Ты сможешь подать новую заявку через {DENY_COOLDOWN_HOURS} часа(ов) — '
+                'просто нажми кнопку в канале с белым списком ещё раз.'
+            ),
+            color=ERROR,
+        ))
+
+    await _archive(bot, guild, app, f'ОТКЛОНЕНА — {reason[:200]}', ERROR, reviewer)
+
+    warn_dm = '' if dm_sent else '\n⚠️ Не удалось отправить игроку ЛС (закрыты личные сообщения).'
+    await interaction.followup.send(
+        embed=err(
+            f'Заявка отклонена.\n**Причина:** {reason}{warn_dm}\n\nКанал будет удалён через 5 секунд.',
+            title='Заявка отклонена',
+        )
+    )
+    await record_audit(bot, guild.id, 'whitelist.denied', actor_id=reviewer.id, target_id=user_id, reason=reason, metadata={'app_id': _row(app, 'id')})
+    logger.info(f'WL app #{_row(app, "id")} denied for {user_id} by {reviewer}: {reason}')
+    asyncio.create_task(_close_channel(interaction))
+
+
+# ═══════════════════════════ КОМАНДЫ ════════════════════════════════════════
+
+class Whitelist(commands.Cog):
+    wl = app_commands.Group(
+        name='whitelist',
+        description='Управление белым списком',
+        guild_only=True,
+        default_permissions=discord.Permissions(manage_guild=True),
+    )
+
+    def __init__(self, bot):
+        self.bot = bot
+
+    async def cog_load(self):
+        await self.bot.db.db.executescript(
+            '''
+            CREATE TABLE IF NOT EXISTS wl_mc_queue (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                nick TEXT NOT NULL,
+                attempts INTEGER DEFAULT 0,
+                created_at TEXT
+            );
+            CREATE TABLE IF NOT EXISTS wl_panels (
+                guild_id INTEGER NOT NULL,
+                channel_id INTEGER NOT NULL,
+                message_id INTEGER NOT NULL,
+                PRIMARY KEY (guild_id, channel_id)
+            );
+            '''
+        )
+        await self.bot.db.db.commit()
+        self._queue_worker.start()
+
+    def cog_unload(self):
+        self._queue_worker.cancel()
+
+    # ── Фоновая выдача вайтлиста, если сервер был недоступен ────────────────
+
+    @tasks.loop(minutes=5)
+    async def _queue_worker(self):
+        try:
+            rows = await _fetchall(
+                self.bot, 'SELECT * FROM wl_mc_queue WHERE attempts < ? ORDER BY id LIMIT 25',
+                (MAX_QUEUE_ATTEMPTS,),
+            )
+        except Exception:
+            return
+        for row in rows:
+            guild = self.bot.get_guild(int(_row(row, 'guild_id', 0)))
+            if not guild:
+                continue
+            s = await _settings(self.bot, guild.id)
+            success, _ = await _mc_whitelist_add(s, str(_row(row, 'nick', '')))
+            if success:
+                await _exec(self.bot, 'DELETE FROM wl_mc_queue WHERE id = ?', (_row(row, 'id'),))
+                member = guild.get_member(int(_row(row, 'user_id', 0)))
+                if member:
+                    await _dm(member, discord.Embed(
+                        title='✅ Ты добавлен на игровой сервер',
+                        description=f'Ник `{_row(row, "nick")}` добавлен в вайтлист. Заходи играть 💚',
+                        color=SUCCESS,
+                    ))
+            else:
+                await _exec(
+                    self.bot, 'UPDATE wl_mc_queue SET attempts = attempts + 1 WHERE id = ?',
+                    (_row(row, 'id'),),
+                )
+
+    @_queue_worker.before_loop
+    async def _before_queue(self):
+        await self.bot.wait_until_ready()
+
+    # ── /whitelist panel ────────────────────────────────────────────────────
+
+    @wl.command(name='panel', description='Отправить кнопку «Подать заявку» в выбранный канал')
+    @app_commands.describe(channel='Канал для кнопки (по умолчанию — текущий)')
+    async def panel(self, interaction: discord.Interaction, channel: discord.TextChannel = None):
+        target = channel or interaction.channel
+        await interaction.response.defer(ephemeral=True)
+
+        # Удаляем старую панель в этом канале, чтобы не плодить дубли
+        old = await _fetchone(
+            self.bot, 'SELECT message_id FROM wl_panels WHERE guild_id = ? AND channel_id = ?',
+            (interaction.guild_id, target.id),
+        )
+        if old:
+            try:
+                old_msg = await target.fetch_message(int(_row(old, 'message_id', 0)))
+                await old_msg.delete()
+            except Exception:
+                pass
+
+        try:
+            msg = await target.send(view=WhitelistPanelView())
+        except discord.Forbidden:
+            await interaction.followup.send(
+                embed=err(f'Нет прав писать в {target.mention}. Дай боту «Отправлять сообщения».'),
+                ephemeral=True,
+            )
+            return
+        except discord.HTTPException:
+            msg = await target.send(content='\u200b', view=WhitelistPanelView())
+
+        await _exec(
+            self.bot,
+            'INSERT OR REPLACE INTO wl_panels (guild_id, channel_id, message_id) VALUES (?, ?, ?)',
+            (interaction.guild_id, target.id, msg.id),
+        )
+        await self.bot.db.set(interaction.guild_id, wl_info_channel_id=target.id)
+        await interaction.followup.send(
+            embed=ok(f'Кнопка подачи заявки отправлена в {target.mention}.'), ephemeral=True,
+        )
+
+    @wl.command(name='post_info', description='Отправить информационный embed о белом списке')
+    @app_commands.describe(channel='Канал (по умолчанию — текущий)')
+    async def post_info(self, interaction: discord.Interaction, channel: discord.TextChannel = None):
+        target = channel or interaction.channel
+        await target.send(embed=wl_info_embed())
+        await interaction.response.send_message(
+            embed=ok(f'Информация отправлена в {target.mention}.'), ephemeral=True,
+        )
+
+    # ── Ручное одобрение / отказ ────────────────────────────────────────────
+
+    @wl.command(name='approve', description='Одобрить заявку вручную (в канале заявки)')
+    async def approve_cmd(self, interaction: discord.Interaction):
+        app = await _get_app_by_channel(self.bot, interaction.channel_id)
+        if not app or _row(app, 'status') != 'pending':
+            await interaction.response.send_message(
+                embed=err('Активной заявки в этом канале нет. Используй команду внутри канала заявки.'),
+                ephemeral=True,
+            )
+            return
+        await interaction.response.defer()
+        await _finish_approve(interaction, app, interaction.user)
+
+    @wl.command(name='deny', description='Отклонить заявку вручную с причиной (в канале заявки)')
+    @app_commands.describe(reason='Причина отказа — её увидит игрок')
+    async def deny_cmd(self, interaction: discord.Interaction, reason: str):
+        app = await _get_app_by_channel(self.bot, interaction.channel_id)
+        if not app or _row(app, 'status') != 'pending':
+            await interaction.response.send_message(
+                embed=err('Активной заявки в этом канале нет. Используй команду внутри канала заявки.'),
+                ephemeral=True,
+            )
+            return
+        await interaction.response.defer()
+        await _finish_deny(interaction, app, interaction.user, reason)
+
+    # ── Управление участниками ──────────────────────────────────────────────
+
+    @wl.command(name='revoke', description='Забрать белый список у участника')
+    @app_commands.describe(member='Участник', reason='Причина (увидит игрок в ЛС)')
+    async def revoke(self, interaction: discord.Interaction, member: discord.Member, reason: str = 'не указана'):
+        await interaction.response.defer(ephemeral=True)
+        s = await _settings(self.bot, interaction.guild_id)
+        app = await _fetchone(
+            self.bot,
+            "SELECT minecraft_nick FROM whitelist_apps "
+            "WHERE guild_id = ? AND user_id = ? AND status IN ('approved', 'completed') "
+            "ORDER BY id DESC LIMIT 1",
+            (interaction.guild_id, member.id),
+        )
+        nick = str(_row(app, 'minecraft_nick', '')).strip() if app else ''
+        role_id = _row(s, 'wl_role_id')
+        if role_id:
+            role = interaction.guild.get_role(int(role_id))
+            if role and role in member.roles:
+                try:
+                    await member.remove_roles(role, reason=f'Whitelist revoked by {interaction.user}: {reason}')
+                except Exception:
+                    pass
+        mc_ok, mc_note = await _mc_whitelist_remove(s, nick)
+        await _exec(
+            self.bot,
+            "UPDATE whitelist_apps SET status = 'denied', reviewed_by = ?, reviewed_at = ? "
+            "WHERE guild_id = ? AND user_id = ? AND status IN ('approved', 'completed')",
+            (interaction.user.id, datetime.now(timezone.utc).isoformat(), interaction.guild_id, member.id),
+        )
+        await _dm(member, discord.Embed(
+            title='Доступ к серверу отозван',
+            description=f'Твой белый список на **Fluffy Vanilla** отозван.\n**Причина:** {reason}',
+            color=ERROR,
+        ))
+        if mc_ok:
+            await interaction.followup.send(
+                embed=ok(f'Whitelist отозван у {member.mention}; Minecraft-ник `{nick}` удалён с сервера.'),
+                ephemeral=True,
+            )
+        else:
+            await interaction.followup.send(
+                embed=warn(f'Роль и статус отозваны, но Minecraft whitelist не обновлён.\n{mc_note}'),
+                ephemeral=True,
+            )
+
+    @wl.command(name='reset', description='Сбросить историю заявок участника (сможет подать заново сразу)')
+    @app_commands.describe(member='Участник')
+    async def reset(self, interaction: discord.Interaction, member: discord.Member):
+        await _exec(
+            self.bot, 'DELETE FROM whitelist_apps WHERE guild_id = ? AND user_id = ?',
+            (interaction.guild_id, member.id),
+        )
+        await interaction.response.send_message(
+            embed=ok(f'История заявок {member.mention} очищена — теперь можно подать новую заявку.'),
+            ephemeral=True,
+        )
+
+    @wl.command(name='status', description='Показать статус заявки участника')
+    @app_commands.describe(member='Участник')
+    async def status(self, interaction: discord.Interaction, member: discord.Member):
+        app = await _fetchone(
+            self.bot,
+            'SELECT * FROM whitelist_apps WHERE guild_id = ? AND user_id = ? ORDER BY id DESC LIMIT 1',
+            (interaction.guild_id, member.id),
+        )
+        if not app:
+            await interaction.response.send_message(
+                embed=info(f'{member.mention} ещё не подавал(а) заявку.'), ephemeral=True,
+            )
+            return
+        labels = {
+            'pending': '⏳ на рассмотрении',
+            'approved': '✅ одобрена',
+            'completed': '✅ одобрена',
+            'denied': '❌ отклонена',
+        }
+        e = discord.Embed(title=f'Заявка #{_row(app, "id")}', color=PINK)
+        e.add_field(name='Игрок', value=member.mention, inline=True)
+        e.add_field(name='Ник', value=str(_row(app, 'minecraft_nick', '—')), inline=True)
+        e.add_field(name='Статус', value=labels.get(str(_row(app, 'status')), str(_row(app, 'status'))), inline=True)
+        e.add_field(name='Подана', value=str(_row(app, 'created_at', '—'))[:19], inline=True)
+        if _row(app, 'reviewed_by'):
+            e.add_field(name='Рассмотрел', value=f'<@{_row(app, "reviewed_by")}>', inline=True)
+        await interaction.response.send_message(embed=e, ephemeral=True)
+
+    # ── Статистика и синхронизация ──────────────────────────────────────────
+
+    @wl.command(name='stats', description='Статистика по заявкам белого списка')
+    async def stats(self, interaction: discord.Interaction):
+        rows = await _fetchall(
+            self.bot,
+            'SELECT status, COUNT(*) AS cnt FROM whitelist_apps WHERE guild_id = ? GROUP BY status',
+            (interaction.guild_id,),
+        )
+        counts = {str(_row(r, 'status')): int(_row(r, 'cnt', 0)) for r in rows}
+        approved = counts.get('approved', 0) + counts.get('completed', 0)
+        pending = counts.get('pending', 0)
+        denied = counts.get('denied', 0)
+        total = approved + pending + denied
+
+        queued = await _fetchone(
+            self.bot, 'SELECT COUNT(*) AS cnt FROM wl_mc_queue WHERE guild_id = ?',
+            (interaction.guild_id,),
+        )
+        in_queue = int(_row(queued, 'cnt', 0))
+
+        rate = f'{approved / total * 100:.0f}%' if total else '—'
+        e = discord.Embed(title='📊 Статистика белого списка', color=PINK)
+        e.add_field(name='Всего заявок', value=str(total), inline=True)
+        e.add_field(name='Одобрено', value=str(approved), inline=True)
+        e.add_field(name='Отклонено', value=str(denied), inline=True)
+        e.add_field(name='На рассмотрении', value=str(pending), inline=True)
+        e.add_field(name='Процент одобрений', value=rate, inline=True)
+        e.add_field(name='Ждут выдачи на MC-сервере', value=str(in_queue), inline=True)
+        e.set_footer(text='Fluffy Vanilla')
+        await interaction.response.send_message(embed=e, ephemeral=True)
+
+    @wl.command(name='sync', description='Перезалить все одобренные ники в вайтлист Minecraft-сервера')
+    async def sync(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        s = await _settings(self.bot, interaction.guild_id)
+        if not (_row(s, 'mc_host') and _row(s, 'mc_api_key')):
+            await interaction.followup.send(
+                embed=err('Сначала настрой подключение к плагину: `/setup stats_plugin`'), ephemeral=True,
+            )
+            return
+        rows = await _fetchall(
+            self.bot,
+            "SELECT DISTINCT minecraft_nick FROM whitelist_apps WHERE guild_id = ? "
+            "AND status IN ('approved', 'completed')",
+            (interaction.guild_id,),
+        )
+        done, failed = 0, 0
+        for r in rows:
+            success, _ = await _mc_whitelist_add(s, str(_row(r, 'minecraft_nick', '')))
+            if success:
+                done += 1
+            else:
+                failed += 1
+            await asyncio.sleep(0.3)
+        await interaction.followup.send(
+            embed=ok(f'Синхронизация завершена: добавлено `{done}`, ошибок `{failed}`.'), ephemeral=True,
+        )
+
+    @wl.command(name='queue', description='Показать ники, ожидающие выдачи на Minecraft-сервере')
+    async def queue(self, interaction: discord.Interaction):
+        rows = await _fetchall(
+            self.bot,
+            'SELECT * FROM wl_mc_queue WHERE guild_id = ? ORDER BY id LIMIT 20', (interaction.guild_id,),
+        )
+        if not rows:
+            await interaction.response.send_message(
+                embed=ok('Очередь пуста — все одобренные ники выданы на сервере.'), ephemeral=True,
+            )
+            return
+        lines = [
+            f'• `{_row(r, "nick")}` — <@{_row(r, "user_id")}> (попыток: {_row(r, "attempts", 0)})'
+            for r in rows
+        ]
+        await interaction.response.send_message(
+            embed=warn('\n'.join(lines), title='⏳ Ожидают выдачи на сервере'), ephemeral=True,
+        )
+
+
+async def setup(bot):
+    await bot.add_cog(Whitelist(bot))
